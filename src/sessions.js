@@ -157,6 +157,13 @@ const reinjectHelpers = async (client) => {
     return false
   }
   await client.pupPage.evaluate(LoadUtils)
+  // Defining window.WWebJS here makes the library's own sync callback believe the
+  // page is already injected, so it skips attachEventListeners(). Without that
+  // call the page keeps no event subscriptions and no message/chat events are
+  // ever emitted. Wire them up ourselves.
+  if (client.attachEventListeners) {
+    await client.attachEventListeners()
+  }
   // LoadUtils recreates window.WWebJS from scratch, so re-apply the overrides.
   await patchWWebLibrary(client)
   return true

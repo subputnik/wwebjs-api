@@ -27,6 +27,10 @@ const browserCloseTimeoutMs = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS) || 
 // for longer than this is taken offline to free memory; the auth folder is kept
 // so the session can be linked again later through the regular start endpoint.
 const unpairedSessionMaxAgeMs = parseInt(process.env.UNPAIRED_SESSION_MAX_AGE_MS) || 0
+// How often to check that each session still has a live browser. 0 disables it.
+const sessionWatchdogIntervalMs = process.env.SESSION_WATCHDOG_INTERVAL_MS === undefined
+  ? 60000
+  : (parseInt(process.env.SESSION_WATCHDOG_INTERVAL_MS, 10) || 0)
 const logLevel = process.env.LOG_LEVEL || 'info'
 const enableWebHook = process.env.ENABLE_WEBHOOK ? (process.env.ENABLE_WEBHOOK).toLowerCase() === 'true' : true
 const enableWebSocket = process.env.ENABLE_WEBSOCKET ? (process.env.ENABLE_WEBSOCKET).toLowerCase() === 'true' : false
@@ -57,6 +61,7 @@ module.exports = {
   recoverSessionMaxDelayMs,
   browserCloseTimeoutMs,
   unpairedSessionMaxAgeMs,
+  sessionWatchdogIntervalMs,
   logLevel,
   enableWebHook,
   enableWebSocket,

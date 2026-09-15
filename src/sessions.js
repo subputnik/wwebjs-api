@@ -2,7 +2,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs, sessionWatchdogIntervalMs } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
@@ -18,6 +18,10 @@ const sessionRecoverAttempts = new Map()
 const suspendedSessions = new Set()
 // Timestamp of the first QR seen for a session that is not authenticated yet.
 const unpairedSince = new Map()
+// Sessions currently being recovered automatically (guards re-entrancy).
+const recoveringSessions = new Set()
+// Sessions being stopped on purpose; their browser must not be auto-restarted.
+const stoppingSessions = new Set()
 
 // Check whether a PID is still running (used to detect stale Chromium profile locks)
 const isProcessAlive = (pid) => {
@@ -85,6 +89,40 @@ const closeBrowser = async (client) => {
     } catch (error) {
       logger.error({ err: error }, 'Failed to kill browser process')
     }
+  }
+}
+
+// Restart a session after its browser or page died, with exponential backoff
+// and a hard cap on consecutive attempts.
+const recoverSession = async (sessionId, client, reason) => {
+  if (suspendedSessions.has(sessionId) || stoppingSessions.has(sessionId)) {
+    logger.warn({ sessionId, reason }, 'Session must not be recovered right now, skipping')
+    return
+  }
+  if (recoveringSessions.has(sessionId) || pendingSessions.has(sessionId)) {
+    return
+  }
+  recoveringSessions.add(sessionId)
+  try {
+    const attempts = (sessionRecoverAttempts.get(sessionId) || 0) + 1
+    sessionRecoverAttempts.set(sessionId, attempts)
+    if (attempts > recoverSessionMaxAttempts) {
+      logger.error({ sessionId, attempts, reason }, 'Max session recover attempts reached, giving up')
+      sessions.delete(sessionId)
+      await closeBrowser(client)
+      return
+    }
+    const delay = Math.min(recoverSessionBaseDelayMs * Math.pow(2, attempts - 1), recoverSessionMaxDelayMs)
+    logger.warn({ sessionId, attempts, delay, reason }, 'Restoring session after delay')
+    await sleep(delay)
+    if (suspendedSessions.has(sessionId) || stoppingSessions.has(sessionId)) {
+      return
+    }
+    sessions.delete(sessionId)
+    await closeBrowser(client)
+    await setupSession(sessionId)
+  } finally {
+    recoveringSessions.delete(sessionId)
   }
 }
 
@@ -178,6 +216,7 @@ const createSession = async (sessionId) => {
   try {
     logger.info({ sessionId }, 'Session is being initiated')
     suspendedSessions.delete(sessionId)
+    stoppingSessions.delete(sessionId)
     unpairedSince.delete(sessionId)
     // Disable the delete folder from the logout function (will be handled separately)
     const localAuth = new LocalAuth({ clientId: sessionId, dataPath: sessionFolderPath })
@@ -306,42 +345,22 @@ const initializeEvents = (client, sessionId) => {
 
   if (recoverSessions) {
     waitForNestedObject(client, 'pupPage').then(() => {
-      let restoring = false
-      const restartSession = async (reason) => {
-        if (suspendedSessions.has(sessionId)) {
-          logger.warn({ sessionId, reason }, 'Session is suspended, not restoring')
-          return
-        }
-        const attempts = (sessionRecoverAttempts.get(sessionId) || 0) + 1
-        sessionRecoverAttempts.set(sessionId, attempts)
-        if (attempts > recoverSessionMaxAttempts) {
-          logger.error({ sessionId, attempts, reason }, 'Max session recover attempts reached, giving up')
-          sessions.delete(sessionId)
-          await closeBrowser(client)
-          return
-        }
-        const delay = Math.min(recoverSessionBaseDelayMs * Math.pow(2, attempts - 1), recoverSessionMaxDelayMs)
-        logger.warn({ sessionId, attempts, delay, reason }, 'Browser page lost, restoring session after delay')
-        await sleep(delay)
-        if (suspendedSessions.has(sessionId)) {
-          return
-        }
-        sessions.delete(sessionId)
-        await closeBrowser(client)
-        await setupSession(sessionId)
-      }
       const onPageLost = (reason) => {
-        if (restoring) return
-        restoring = true
-        restartSession(reason).catch(err => logger.error({ sessionId, err }, 'Failed to restore session'))
+        recoverSession(sessionId, client, reason)
+          .catch(err => logger.error({ sessionId, err }, 'Failed to restore session'))
       }
       client.pupPage.once('close', function () {
         // emitted when the page closes
-        onPageLost('close')
+        onPageLost('page close')
       })
       client.pupPage.once('error', function () {
         // emitted when the page crashes
-        onPageLost('error')
+        onPageLost('page error')
+      })
+      // A hard browser crash (SIGSEGV / core dump) does not always emit a page
+      // event, but the browser does emit 'disconnected'.
+      client.pupBrowser && client.pupBrowser.once('disconnected', function () {
+        onPageLost('browser disconnected')
       })
       client.pupPage
         .on('console', message => {
@@ -620,6 +639,7 @@ const reloadSession = async (sessionId) => {
     }
     client.pupPage?.removeAllListeners('close')
     client.pupPage?.removeAllListeners('error')
+    stoppingSessions.add(sessionId)
     await closeBrowser(client)
     suspendedSessions.delete(sessionId)
     sessions.delete(sessionId)
@@ -643,6 +663,9 @@ const destroySession = async (sessionId) => {
     } catch (error) {
       logger.error({ sessionId, err: error }, 'Failed to terminate WebSocket server')
     }
+    // Mark as intentionally stopped so a browser 'disconnected' event does not
+    // trigger the automatic recovery.
+    stoppingSessions.add(sessionId)
     await client.destroy().catch(err => logger.error({ sessionId, err }, 'Failed to destroy client'))
     await closeBrowser(client)
     suspendedSessions.delete(sessionId)
@@ -666,6 +689,9 @@ const deleteSession = async (sessionId, validation) => {
     } catch (error) {
       logger.error({ sessionId, err: error }, 'Failed to terminate WebSocket server')
     }
+    // Mark as intentionally stopped so a browser 'disconnected' event does not
+    // trigger the automatic recovery.
+    stoppingSessions.add(sessionId)
     // Always tear the browser down, whatever the validation result said.
     // Previously a session reported as "browser tab closed"/"session closed"
     // skipped both logout and destroy, leaving an orphan Chromium process.
@@ -726,16 +752,18 @@ const flushSessions = async (deleteOnlyInactive) => {
 // Kill all session browsers without starting them again. Used on process
 // shutdown so the Chromium profile locks are released for the next start.
 const shutdownSessions = async () => {
-  const clients = Array.from(sessions.values())
-  for (const client of clients) {
+  const entries = Array.from(sessions.entries())
+  for (const [sessionId, client] of entries) {
+    stoppingSessions.add(sessionId)
     try {
       client.pupPage?.removeAllListeners('close')
       client.pupPage?.removeAllListeners('error')
+      client.pupBrowser?.removeAllListeners('disconnected')
     } catch (error) {
       logger.debug({ err: error }, 'Failed to detach page listeners on shutdown')
     }
   }
-  await Promise.all(clients.map(async (client) => {
+  await Promise.all(entries.map(async ([, client]) => {
     try {
       const childProcess = client.pupBrowser?.process()
       if (childProcess && childProcess.exitCode === null && childProcess.signalCode === null) {
@@ -750,6 +778,40 @@ const shutdownSessions = async () => {
   sessions.clear()
 }
 
+// Periodically verify that every session still has a live browser. A hard
+// Chromium crash (SIGSEGV / core dump) can leave a session silently dead
+// without emitting any page event, so nothing else would notice it.
+let sessionWatchdog = null
+const startSessionWatchdog = (intervalMs = sessionWatchdogIntervalMs) => {
+  if (sessionWatchdog || !intervalMs || intervalMs <= 0) {
+    return
+  }
+  sessionWatchdog = setInterval(() => {
+    for (const [sessionId, client] of sessions.entries()) {
+      if (pendingSessions.has(sessionId) || recoveringSessions.has(sessionId) ||
+        suspendedSessions.has(sessionId) || stoppingSessions.has(sessionId)) {
+        continue
+      }
+      let alive = false
+      try {
+        alive = Boolean(client.pupBrowser) && client.pupBrowser.isConnected() &&
+          Boolean(client.pupPage) && !client.pupPage.isClosed()
+      } catch (error) {
+        alive = false
+      }
+      if (!alive) {
+        logger.warn({ sessionId }, 'Watchdog: session browser is gone, restoring')
+        recoverSession(sessionId, client, 'watchdog')
+          .catch(err => logger.error({ sessionId, err }, 'Watchdog recovery failed'))
+      }
+    }
+  }, intervalMs)
+  if (sessionWatchdog.unref) {
+    sessionWatchdog.unref()
+  }
+  logger.info({ intervalMs }, 'Session watchdog started')
+}
+
 module.exports = {
   sessions,
   setupSession,
@@ -759,5 +821,6 @@ module.exports = {
   reloadSession,
   flushSessions,
   destroySession,
-  shutdownSessions
+  shutdownSessions,
+  startSessionWatchdog
 }

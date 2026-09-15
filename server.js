@@ -2,7 +2,7 @@ const app = require('./src/app')
 const { servicePort, baseWebhookURL, enableWebHook, enableWebSocket, autoStartSessions } = require('./src/config')
 const { logger } = require('./src/logger')
 const { handleUpgrade } = require('./src/websocket')
-const { restoreSessions, shutdownSessions } = require('./src/sessions')
+const { restoreSessions, shutdownSessions, startSessionWatchdog } = require('./src/sessions')
 
 // Check if BASE_WEBHOOK_URL environment variable is available when WebHook is enabled
 if (!baseWebhookURL && enableWebHook) {
@@ -28,6 +28,9 @@ if (enableWebSocket) {
 // puppeteer uses subscriptions to SIGINT, SIGTERM, and SIGHUP to know when to close browser instances
 // this disables the warnings when you starts more than 10 browser instances
 process.setMaxListeners(0)
+
+// Detect sessions whose browser died without emitting any page event.
+startSessionWatchdog()
 
 // Kill every browser process on shutdown so that the Chromium profile locks are
 // released before the service starts again (otherwise sessions cannot be restored).

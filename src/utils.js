@@ -123,6 +123,22 @@ const patchWWebLibrary = async (client) => {
     return messages.map(m => new Message(this.client, m))
   }
 
+  // WhatsApp Web renamed these Store collections, but whatsapp-web.js still reads
+  // the old names and getChatModel() throws "Cannot read properties of undefined
+  // (reading 'update')" (upstream issues #5752/#5796, fix in PR #5779). Alias the
+  // new names back; fall back to a no-op so listing chats never fails because a
+  // group/newsletter metadata refresh is unavailable.
+  await client.pupPage.evaluate(() => {
+    const store = window.Store
+    if (!store) return
+    if (!store.GroupMetadata) {
+      store.GroupMetadata = store.WAWebGroupMetadataCollection || { update: async () => {} }
+    }
+    if (!store.NewsletterMetadataCollection) {
+      store.NewsletterMetadataCollection = store.WAWebNewsletterMetadataCollection || { update: async () => {} }
+    }
+  })
+
   await client.pupPage.evaluate(() => {
     // hotfix for https://github.com/pedroslopez/whatsapp-web.js/pull/3643
     window.WWebJS.getChats = async (searchOptions = {}) => {

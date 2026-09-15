@@ -1,4 +1,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js')
+// Used to restore window.WWebJS when the library's own re-injection (triggered
+// by a page navigation) stops half way: window.Store exists but the helper does not.
+const { LoadUtils } = require('whatsapp-web.js/src/util/Injected/Utils')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
@@ -112,6 +115,18 @@ const isPageInjected = async (client) => {
   } catch (error) {
     return false
   }
+}
+
+// Restore the library helper without restarting the browser. Safe to call when
+// window.Store is present; throws (and is caught by the caller) otherwise.
+const reinjectHelpers = async (client) => {
+  if (!client || !client.pupPage || client.pupPage.isClosed()) {
+    return false
+  }
+  await client.pupPage.evaluate(LoadUtils)
+  // LoadUtils recreates window.WWebJS from scratch, so re-apply the overrides.
+  await patchWWebLibrary(client)
+  return true
 }
 
 // Restart a session after its browser or page died, with exponential backoff
@@ -845,10 +860,23 @@ const startSessionWatchdog = (intervalMs = sessionWatchdogIntervalMs) => {
         injectionFailures.delete(sessionId)
         continue
       }
+      // Try a cheap in-place re-injection first; a browser restart is the fallback.
+      let reinjected = false
+      try {
+        reinjected = await reinjectHelpers(client)
+      } catch (error) {
+        logger.warn({ sessionId, err: error }, 'Watchdog: re-injection failed')
+        reinjected = false
+      }
+      if (reinjected && await isPageInjected(client)) {
+        injectionFailures.delete(sessionId)
+        logger.warn({ sessionId }, 'Watchdog: restored the WWebJS helper by re-injecting')
+        continue
+      }
       const failures = (injectionFailures.get(sessionId) || 0) + 1
       injectionFailures.set(sessionId, failures)
       if (failures < 2) {
-        logger.warn({ sessionId, failures }, 'Watchdog: page has no WWebJS helper, will restore if it persists')
+        logger.warn({ sessionId, failures }, 'Watchdog: page still has no WWebJS helper, will restore if it persists')
         continue
       }
       injectionFailures.delete(sessionId)

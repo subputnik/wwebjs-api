@@ -111,7 +111,11 @@ const patchWWebLibrary = async (client) => {
 
       if (searchOptions && searchOptions.limit > 0) {
         while (msgs.length < searchOptions.limit) {
-          const loadedMessages = await window.Store.ConversationMsgs.loadEarlierMsgs(chat)
+          // whatsapp-web.js moved this around: older builds expose
+          // window.Store.ConversationMsgs, 1.34.7+ uses WAWebChatLoadMessages.
+          const loadedMessages = (window.Store && window.Store.ConversationMsgs)
+            ? await window.Store.ConversationMsgs.loadEarlierMsgs(chat)
+            : await window.require('WAWebChatLoadMessages').loadEarlierMsgs({ chat })
           if (!loadedMessages || !loadedMessages.length) break
           msgs = [...loadedMessages.filter(msgFilter), ...msgs]
         }
@@ -184,7 +188,9 @@ const patchWWebLibrary = async (client) => {
         return true
       }
 
-      const allChats = window.Store.Chat.getModelsArray()
+      // 1.34.7+ dropped window.Store in favour of window.require('WAWebCollections').
+      const collections = window.Store || window.require('WAWebCollections')
+      const allChats = collections.Chat.getModelsArray()
 
       const filteredChats = allChats.filter(chatFilter)
 

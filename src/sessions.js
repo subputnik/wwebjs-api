@@ -99,9 +99,9 @@ const closeBrowser = async (client) => {
   }
 }
 
-// Check that the page still has BOTH the WhatsApp Web Store and the helper
-// object injected by whatsapp-web.js. Client.getState() only reads window.Store,
-// so a page can look CONNECTED while every window.WWebJS call fails with
+// Check that the library helper is still injected. Client.getState() only reads
+// the WhatsApp socket state, so a page can look CONNECTED while every
+// window.WWebJS call fails with
 // "Cannot read properties of undefined (reading 'getChat')".
 const isPageInjected = async (client) => {
   if (!client || !client.pupPage || client.pupPage.isClosed()) {
@@ -109,7 +109,7 @@ const isPageInjected = async (client) => {
   }
   try {
     return await Promise.race([
-      client.pupPage.evaluate(() => typeof window.WWebJS !== 'undefined' && typeof window.Store !== 'undefined'),
+      client.pupPage.evaluate(() => typeof window.WWebJS !== 'undefined' && typeof window.WWebJS.getChats === 'function'),
       sleep(5000).then(() => false)
     ])
   } catch (error) {
@@ -117,8 +117,8 @@ const isPageInjected = async (client) => {
   }
 }
 
-// Restore the library helper without restarting the browser. Safe to call when
-// window.Store is present; throws (and is caught by the caller) otherwise.
+// Restore the library helper without restarting the browser. Requires the page
+// module loader to be present; throws (and is caught by the caller) otherwise.
 const reinjectHelpers = async (client) => {
   if (!client || !client.pupPage || client.pupPage.isClosed()) {
     return false
@@ -214,7 +214,7 @@ const validateSession = async (sessionId) => {
       return returnData
     }
 
-    // getState() only proves window.Store exists; make sure the library helper
+    // getState() only proves the socket is CONNECTED; make sure the library helper
     // is injected too, otherwise the session cannot serve any chat request.
     if (!(await isPageInjected(client))) {
       returnData.message = 'session_not_connected'

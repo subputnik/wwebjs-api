@@ -79,11 +79,16 @@ const exposeFunctionIfAbsent = async (page, name, fn) => {
 const patchWWebLibrary = async (client) => {
   // MUST be run after the 'ready' event fired
   Client.prototype.getChats = async function (searchOptions = {}) {
-    const chats = await this.pupPage.evaluate(async (searchOptions) => {
-      return await window.WWebJS.getChats({ ...searchOptions })
-    }, searchOptions)
+    try {
+      const chats = await this.pupPage.evaluate(async (searchOptions) => {
+        return await window.WWebJS.getChats({ ...searchOptions })
+      }, searchOptions)
 
-    return chats.map(chat => ChatFactory.create(this, chat))
+      return chats.map(chat => ChatFactory.create(this, chat))
+    } catch (error) {
+      logger.error({ err: error, message: error && error.message, stack: error && error.stack }, 'Failed to get chats')
+      throw error
+    }
   }
 
   Chat.prototype.fetchMessages = async function (searchOptions) {
@@ -137,6 +142,33 @@ const patchWWebLibrary = async (client) => {
     if (!store.NewsletterMetadataCollection) {
       store.NewsletterMetadataCollection = store.WAWebNewsletterMetadataCollection || { update: async () => {} }
     }
+  })
+
+  // Some chats (notably @lid ones) make the library's getChatModel fail deep in
+  // WhatsApp Web's IndexedDB layer ("IDBObjectStore.get: No key or key range
+  // specified"). Wrap it so one bad chat degrades to a minimal model instead of
+  // failing the whole chat listing.
+  await client.pupPage.evaluate(() => {
+    if (!window.WWebJS || window.WWebJS.__getChatModelPatched) return
+    const originalGetChatModel = window.WWebJS.getChatModel
+    window.WWebJS.getChatModel = async (chat, options = {}) => {
+      try {
+        return await originalGetChatModel(chat, options)
+      } catch (error) {
+        if (!chat || typeof chat.serialize !== 'function') {
+          throw error
+        }
+        const model = chat.serialize()
+        model.isGroup = Boolean(chat.groupMetadata)
+        model.isChannel = options.isChannel === true || Boolean(chat.newsletterMetadata)
+        model.lastMessage = null
+        delete model.msgs
+        delete model.msgUnsyncedButtonReplyMsgs
+        delete model.unsyncedButtonReplies
+        return model
+      }
+    }
+    window.WWebJS.__getChatModelPatched = true
   })
 
   await client.pupPage.evaluate(() => {

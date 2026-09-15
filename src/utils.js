@@ -151,24 +151,49 @@ const patchWWebLibrary = async (client) => {
   // Some chats (notably @lid ones) make the library's getChatModel fail deep in
   // WhatsApp Web's IndexedDB layer ("IDBObjectStore.get: No key or key range
   // specified"). Wrap it so one bad chat degrades to a minimal model instead of
-  // failing the whole chat listing.
+  // failing the whole chat listing. The fallback itself must never throw: even
+  // chat.serialize() can fail for those chats.
   await client.pupPage.evaluate(() => {
     if (!window.WWebJS || window.WWebJS.__getChatModelPatched) return
+
+    const minimalChatModel = (chat) => {
+      let model = null
+      try {
+        model = chat && typeof chat.serialize === 'function' ? chat.serialize() : null
+      } catch (error) {
+        model = null
+      }
+      if (!model || typeof model !== 'object') {
+        model = {
+          id: chat && chat.id && chat.id._serialized
+            ? { server: chat.id.server, user: chat.id.user, _serialized: chat.id._serialized }
+            : null,
+          name: (chat && (chat.name || chat.formattedTitle)) || null,
+          unreadCount: (chat && chat.unreadCount) || 0,
+          timestamp: (chat && chat.t) || null
+        }
+      }
+      model.isGroup = Boolean(chat && chat.groupMetadata)
+      model.isChannel = Boolean(chat && chat.newsletterMetadata)
+      model.lastMessage = null
+      delete model.msgs
+      delete model.msgUnsyncedButtonReplyMsgs
+      delete model.unsyncedButtonReplies
+      return model
+    }
+
+    window.WWebJS.__minimalChatModel = minimalChatModel
+
     const originalGetChatModel = window.WWebJS.getChatModel
     window.WWebJS.getChatModel = async (chat, options = {}) => {
       try {
         return await originalGetChatModel(chat, options)
       } catch (error) {
-        if (!chat || typeof chat.serialize !== 'function') {
+        if (!chat) {
           throw error
         }
-        const model = chat.serialize()
-        model.isGroup = Boolean(chat.groupMetadata)
-        model.isChannel = options.isChannel === true || Boolean(chat.newsletterMetadata)
-        model.lastMessage = null
-        delete model.msgs
-        delete model.msgUnsyncedButtonReplyMsgs
-        delete model.unsyncedButtonReplies
+        const model = minimalChatModel(chat)
+        model.isChannel = options.isChannel === true || model.isChannel
         return model
       }
     }
@@ -194,9 +219,16 @@ const patchWWebLibrary = async (client) => {
 
       const filteredChats = allChats.filter(chatFilter)
 
-      return await Promise.all(
-        filteredChats.map(chat => window.WWebJS.getChatModel(chat))
-      )
+      // Never let a single un-serializable chat fail the whole listing.
+      const safeChatModel = async (chat) => {
+        try {
+          return await window.WWebJS.getChatModel(chat)
+        } catch (error) {
+          return window.WWebJS.__minimalChatModel(chat)
+        }
+      }
+
+      return await Promise.all(filteredChats.map(safeChatModel))
     }
   })
 }

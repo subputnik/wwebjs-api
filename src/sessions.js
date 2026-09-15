@@ -117,6 +117,39 @@ const isPageInjected = async (client) => {
   }
 }
 
+// A page navigation makes the library rebuild window.WWebJS from scratch, which
+// wipes the page-side overrides applied by patchWWebLibrary(). The helper is
+// present again, so the session looks healthy, but the chat methods silently
+// fall back to the buggy library versions.
+const isPagePatched = async (client) => {
+  if (!client || !client.pupPage || client.pupPage.isClosed()) {
+    return false
+  }
+  try {
+    return await Promise.race([
+      client.pupPage.evaluate(() => Boolean(window.WWebJS && window.WWebJS.__getChatModelPatched)),
+      sleep(5000).then(() => false)
+    ])
+  } catch (error) {
+    return false
+  }
+}
+
+// Re-apply the page-side overrides if they were lost. Cheap and idempotent.
+const ensurePagePatched = async (client, sessionId) => {
+  if (await isPagePatched(client)) {
+    return true
+  }
+  logger.warn({ sessionId }, 'Session page lost the WWebJS overrides, re-applying')
+  try {
+    await patchWWebLibrary(client)
+    return await isPagePatched(client)
+  } catch (error) {
+    logger.error({ sessionId, err: error }, 'Failed to re-apply WWebJS overrides')
+    return false
+  }
+}
+
 // Restore the library helper without restarting the browser. Requires the page
 // module loader to be present; throws (and is caught by the caller) otherwise.
 const reinjectHelpers = async (client) => {
@@ -217,6 +250,12 @@ const validateSession = async (sessionId) => {
     // getState() only proves the socket is CONNECTED; make sure the library helper
     // is injected too, otherwise the session cannot serve any chat request.
     if (!(await isPageInjected(client))) {
+      returnData.message = 'session_not_connected'
+      return returnData
+    }
+
+    // The helper can be present while our overrides were wiped by a navigation.
+    if (!(await ensurePagePatched(client, sessionId))) {
       returnData.message = 'session_not_connected'
       return returnData
     }
@@ -858,6 +897,8 @@ const startSessionWatchdog = (intervalMs = sessionWatchdogIntervalMs) => {
       // The browser is up, but the page may have lost the injected WWebJS helper.
       if (await isPageInjected(client)) {
         injectionFailures.delete(sessionId)
+        // ...or it was rebuilt by a navigation and our overrides are gone.
+        await ensurePagePatched(client, sessionId)
         continue
       }
       // Try a cheap in-place re-injection first; a browser restart is the fallback.

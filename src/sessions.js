@@ -22,6 +22,10 @@ const unpairedSince = new Map()
 const recoveringSessions = new Set()
 // Sessions being stopped on purpose; their browser must not be auto-restarted.
 const stoppingSessions = new Set()
+// Consecutive watchdog ticks where a live page was missing the injected
+// window.WWebJS helper (it disappears when WhatsApp Web navigates and the
+// library fails to re-inject). Used to avoid restarting on a short blip.
+const injectionFailures = new Map()
 
 // Check whether a PID is still running (used to detect stale Chromium profile locks)
 const isProcessAlive = (pid) => {
@@ -89,6 +93,24 @@ const closeBrowser = async (client) => {
     } catch (error) {
       logger.error({ err: error }, 'Failed to kill browser process')
     }
+  }
+}
+
+// Check that the page still has BOTH the WhatsApp Web Store and the helper
+// object injected by whatsapp-web.js. Client.getState() only reads window.Store,
+// so a page can look CONNECTED while every window.WWebJS call fails with
+// "Cannot read properties of undefined (reading 'getChat')".
+const isPageInjected = async (client) => {
+  if (!client || !client.pupPage || client.pupPage.isClosed()) {
+    return false
+  }
+  try {
+    return await Promise.race([
+      client.pupPage.evaluate(() => typeof window.WWebJS !== 'undefined' && typeof window.Store !== 'undefined'),
+      sleep(5000).then(() => false)
+    ])
+  } catch (error) {
+    return false
   }
 }
 
@@ -173,6 +195,13 @@ const validateSession = async (sessionId) => {
     const state = await client.getState()
     returnData.state = state
     if (state !== 'CONNECTED') {
+      returnData.message = 'session_not_connected'
+      return returnData
+    }
+
+    // getState() only proves window.Store exists; make sure the library helper
+    // is injected too, otherwise the session cannot serve any chat request.
+    if (!(await isPageInjected(client))) {
       returnData.message = 'session_not_connected'
       return returnData
     }
@@ -302,6 +331,7 @@ const createSession = async (sessionId) => {
     try {
       client.once('ready', () => {
         sessionRecoverAttempts.delete(sessionId)
+        injectionFailures.delete(sessionId)
         unpairedSince.delete(sessionId)
         patchWWebLibrary(client).catch((err) => {
           logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
@@ -782,11 +812,16 @@ const shutdownSessions = async () => {
 // Chromium crash (SIGSEGV / core dump) can leave a session silently dead
 // without emitting any page event, so nothing else would notice it.
 let sessionWatchdog = null
+let watchdogRunning = false
 const startSessionWatchdog = (intervalMs = sessionWatchdogIntervalMs) => {
   if (sessionWatchdog || !intervalMs || intervalMs <= 0) {
     return
   }
-  sessionWatchdog = setInterval(() => {
+  sessionWatchdog = setInterval(async () => {
+    if (watchdogRunning) {
+      return
+    }
+    watchdogRunning = true
     for (const [sessionId, client] of sessions.entries()) {
       if (pendingSessions.has(sessionId) || recoveringSessions.has(sessionId) ||
         suspendedSessions.has(sessionId) || stoppingSessions.has(sessionId)) {
@@ -803,8 +838,25 @@ const startSessionWatchdog = (intervalMs = sessionWatchdogIntervalMs) => {
         logger.warn({ sessionId }, 'Watchdog: session browser is gone, restoring')
         recoverSession(sessionId, client, 'watchdog')
           .catch(err => logger.error({ sessionId, err }, 'Watchdog recovery failed'))
+        continue
       }
+      // The browser is up, but the page may have lost the injected WWebJS helper.
+      if (await isPageInjected(client)) {
+        injectionFailures.delete(sessionId)
+        continue
+      }
+      const failures = (injectionFailures.get(sessionId) || 0) + 1
+      injectionFailures.set(sessionId, failures)
+      if (failures < 2) {
+        logger.warn({ sessionId, failures }, 'Watchdog: page has no WWebJS helper, will restore if it persists')
+        continue
+      }
+      injectionFailures.delete(sessionId)
+      logger.warn({ sessionId }, 'Watchdog: page lost the WWebJS helper, restoring')
+      recoverSession(sessionId, client, 'page not injected')
+        .catch(err => logger.error({ sessionId, err }, 'Watchdog recovery failed'))
     }
+    watchdogRunning = false
   }, intervalMs)
   if (sessionWatchdog.unref) {
     sessionWatchdog.unref()

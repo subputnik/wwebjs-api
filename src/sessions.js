@@ -5,7 +5,7 @@ const { LoadUtils } = require('whatsapp-web.js/src/util/Injected/Utils')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs, sessionWatchdogIntervalMs } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, dumpio, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs, sessionWatchdogIntervalMs } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
@@ -317,6 +317,7 @@ const createSession = async (sessionId) => {
       puppeteer: {
         executablePath: chromeBin,
         headless,
+        dumpio,
         args: [
           '--autoplay-policy=user-gesture-required',
           '--disable-background-networking',
@@ -349,9 +350,7 @@ const createSession = async (sessionId) => {
           '--no-default-browser-check',
           '--no-first-run',
           '--no-pings',
-          '--no-zygote',
           '--password-store=basic',
-          '--use-gl=swiftshader',
           '--use-mock-keychain',
           '--disable-setuid-sandbox',
           '--no-sandbox',

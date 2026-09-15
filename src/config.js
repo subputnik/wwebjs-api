@@ -18,6 +18,9 @@ const rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 1000
 const recoverSessions = (process.env.RECOVER_SESSIONS || '').toLowerCase() === 'true'
 const chromeBin = process.env.CHROME_BIN || null
 const headless = process.env.HEADLESS ? (process.env.HEADLESS).toLowerCase() === 'true' : true
+// Pipe the Chromium stdout/stderr into our process output. Needed to see the
+// message Chromium prints right before it aborts (SIGABRT / SIGSEGV).
+const dumpio = (process.env.PUPPETEER_DUMPIO || '').toLowerCase() === 'true'
 const releaseBrowserLock = process.env.RELEASE_BROWSER_LOCK ? (process.env.RELEASE_BROWSER_LOCK).toLowerCase() === 'true' : true
 const recoverSessionMaxAttempts = parseInt(process.env.RECOVER_SESSION_MAX_ATTEMPTS) || 5
 const recoverSessionBaseDelayMs = parseInt(process.env.RECOVER_SESSION_BASE_DELAY_MS) || 5000
@@ -55,6 +58,7 @@ module.exports = {
   recoverSessions,
   chromeBin,
   headless,
+  dumpio,
   releaseBrowserLock,
   recoverSessionMaxAttempts,
   recoverSessionBaseDelayMs,

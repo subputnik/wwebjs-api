@@ -19,6 +19,14 @@ const recoverSessions = (process.env.RECOVER_SESSIONS || '').toLowerCase() === '
 const chromeBin = process.env.CHROME_BIN || null
 const headless = process.env.HEADLESS ? (process.env.HEADLESS).toLowerCase() === 'true' : true
 const releaseBrowserLock = process.env.RELEASE_BROWSER_LOCK ? (process.env.RELEASE_BROWSER_LOCK).toLowerCase() === 'true' : true
+const recoverSessionMaxAttempts = parseInt(process.env.RECOVER_SESSION_MAX_ATTEMPTS) || 5
+const recoverSessionBaseDelayMs = parseInt(process.env.RECOVER_SESSION_BASE_DELAY_MS) || 5000
+const recoverSessionMaxDelayMs = parseInt(process.env.RECOVER_SESSION_MAX_DELAY_MS) || 300000
+const browserCloseTimeoutMs = parseInt(process.env.BROWSER_CLOSE_TIMEOUT_MS) || 10000
+// 0 disables the guard. When set, a session that stays unpaired (QR not scanned)
+// for longer than this is taken offline to free memory; the auth folder is kept
+// so the session can be linked again later through the regular start endpoint.
+const unpairedSessionMaxAgeMs = parseInt(process.env.UNPAIRED_SESSION_MAX_AGE_MS) || 0
 const logLevel = process.env.LOG_LEVEL || 'info'
 const enableWebHook = process.env.ENABLE_WEBHOOK ? (process.env.ENABLE_WEBHOOK).toLowerCase() === 'true' : true
 const enableWebSocket = process.env.ENABLE_WEBSOCKET ? (process.env.ENABLE_WEBSOCKET).toLowerCase() === 'true' : false
@@ -44,6 +52,11 @@ module.exports = {
   chromeBin,
   headless,
   releaseBrowserLock,
+  recoverSessionMaxAttempts,
+  recoverSessionBaseDelayMs,
+  recoverSessionMaxDelayMs,
+  browserCloseTimeoutMs,
+  unpairedSessionMaxAgeMs,
   logLevel,
   enableWebHook,
   enableWebSocket,

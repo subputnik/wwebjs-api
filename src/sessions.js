@@ -29,6 +29,30 @@ const stoppingSessions = new Set()
 // window.WWebJS helper (it disappears when WhatsApp Web navigates and the
 // library fails to re-inject). Used to avoid restarting on a short blip.
 const injectionFailures = new Map()
+// A page rebuild can leave the page listeners attached twice (the library's own
+// attach plus our defensive one at recovery). Dedupe deliveries by event type and
+// message id so the same message is not reported to the webhook twice.
+const seenMessageIds = new Map()
+const isDuplicateDelivery = (kind, message) => {
+  const id = message && message.id && message.id._serialized
+  if (!id) {
+    return false
+  }
+  const key = `${kind}:${id}`
+  const now = Date.now()
+  if (seenMessageIds.has(key)) {
+    return true
+  }
+  seenMessageIds.set(key, now)
+  if (seenMessageIds.size > 2000) {
+    for (const [entryKey, timestamp] of seenMessageIds) {
+      if (now - timestamp > 300000) {
+        seenMessageIds.delete(entryKey)
+      }
+    }
+  }
+  return false
+}
 
 // Check whether a PID is still running (used to detect stale Chromium profile locks)
 const isProcessAlive = (pid) => {
@@ -143,6 +167,12 @@ const ensurePagePatched = async (client, sessionId) => {
   logger.warn({ sessionId }, 'Session page lost the WWebJS overrides, re-applying')
   try {
     await patchWWebLibrary(client)
+    // The overrides disappear when a navigation rebuilds the page, and that
+    // rebuild can leave the page without any event subscriptions. Re-attach
+    // them; duplicate deliveries are filtered by isDuplicateDelivery().
+    if (client.attachEventListeners) {
+      await client.attachEventListeners()
+    }
     return await isPagePatched(client)
   } catch (error) {
     logger.error({ sessionId, err: error }, 'Failed to re-apply WWebJS overrides')
@@ -181,23 +211,26 @@ const recoverSession = async (sessionId, client, reason) => {
   }
   recoveringSessions.add(sessionId)
   try {
-    const attempts = (sessionRecoverAttempts.get(sessionId) || 0) + 1
-    sessionRecoverAttempts.set(sessionId, attempts)
-    if (attempts > recoverSessionMaxAttempts) {
-      logger.error({ sessionId, attempts, reason }, 'Max session recover attempts reached, giving up')
+    for (let attempt = 1; attempt <= recoverSessionMaxAttempts; attempt++) {
+      sessionRecoverAttempts.set(sessionId, attempt)
+      const delay = Math.min(recoverSessionBaseDelayMs * Math.pow(2, attempt - 1), recoverSessionMaxDelayMs)
+      logger.warn({ sessionId, attempt, delay, reason }, 'Restoring session after delay')
+      await sleep(delay)
+      if (suspendedSessions.has(sessionId) || stoppingSessions.has(sessionId)) {
+        return
+      }
       sessions.delete(sessionId)
       await closeBrowser(client)
-      return
+      const result = await setupSession(sessionId)
+      if (result && result.success === true) {
+        return
+      }
+      // A restart can itself fail (e.g. the new browser aborts during start).
+      // Keep retrying instead of leaving the session down until someone notices.
+      logger.warn({ sessionId, attempt, message: result && result.message }, 'Session restore attempt failed, retrying')
     }
-    const delay = Math.min(recoverSessionBaseDelayMs * Math.pow(2, attempts - 1), recoverSessionMaxDelayMs)
-    logger.warn({ sessionId, attempts, delay, reason }, 'Restoring session after delay')
-    await sleep(delay)
-    if (suspendedSessions.has(sessionId) || stoppingSessions.has(sessionId)) {
-      return
-    }
+    logger.error({ sessionId, reason }, 'Max session recover attempts reached, giving up')
     sessions.delete(sessionId)
-    await closeBrowser(client)
-    await setupSession(sessionId)
   } finally {
     recoveringSessions.delete(sessionId)
   }
@@ -318,6 +351,11 @@ const createSession = async (sessionId) => {
         executablePath: chromeBin,
         headless,
         dumpio,
+        // Chromium treats a dropped D-Bus connection as fatal
+        // ("FATAL:dbus/bus.cc] D-Bus connection was disconnected. Aborting.").
+        // The session bus here belongs to transient login sessions, so instead of
+        // connecting to it, tell Chromium to skip D-Bus ("disabled:" sentinel).
+        env: { ...process.env, DBUS_SESSION_BUS_ADDRESS: 'disabled:' },
         args: [
           '--autoplay-policy=user-gesture-required',
           '--disable-background-networking',
@@ -557,6 +595,9 @@ const initializeEvents = (client, sessionId) => {
   }
 
   client.on('message', async (message) => {
+    if (isDuplicateDelivery('message', message)) {
+      return
+    }
     if (isEventEnabled('message')) {
       triggerWebhook(sessionWebhook, sessionId, 'message', { message })
       triggerWebSocket(sessionId, 'message', { message })
@@ -588,6 +629,9 @@ const initializeEvents = (client, sessionId) => {
 
   if (isEventEnabled('message_create')) {
     client.on('message_create', (message) => {
+      if (isDuplicateDelivery('message_create', message)) {
+        return
+      }
       triggerWebhook(sessionWebhook, sessionId, 'message_create', { message })
       triggerWebSocket(sessionId, 'message_create', { message })
     })

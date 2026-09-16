@@ -992,6 +992,21 @@ const startSessionWatchdog = (intervalMs = sessionWatchdogIntervalMs) => {
           .catch(err => logger.error({ sessionId, err }, 'Watchdog recovery failed'))
         continue
       }
+      // A session that is not authenticated yet (showing a QR) legitimately has
+      // no window.WWebJS injected - the library only injects it once the app has
+      // synced after linking. Treating that as broken made the watchdog restart
+      // every unpaired session over and over (and every restart loads the page
+      // again, which is what gets the server IP rate limited).
+      let state = null
+      try {
+        state = await client.getState()
+      } catch (error) {
+        state = null
+      }
+      if (state !== 'CONNECTED') {
+        injectionFailures.delete(sessionId)
+        continue
+      }
       // The browser is up, but the page may have lost the injected WWebJS helper.
       if (await isPageInjected(client)) {
         injectionFailures.delete(sessionId)

@@ -34,6 +34,15 @@ const unpairedSessionMaxAgeMs = parseInt(process.env.UNPAIRED_SESSION_MAX_AGE_MS
 const sessionWatchdogIntervalMs = process.env.SESSION_WATCHDOG_INTERVAL_MS === undefined
   ? 60000
   : (parseInt(process.env.SESSION_WATCHDOG_INTERVAL_MS, 10) || 0)
+// How long /session/start may block before it answers "initiation started".
+// Initializing a session can outlast a client's HTTP timeout (page load +
+// auth timeout), so we answer early and let the caller poll /session/status.
+const sessionStartSyncTimeoutMs = process.env.SESSION_START_SYNC_TIMEOUT_MS === undefined
+  ? 20000
+  : (parseInt(process.env.SESSION_START_SYNC_TIMEOUT_MS, 10) || 0)
+// How many sessions are started in parallel on boot. Keeps one slow or broken
+// session from delaying all the others while limiting the browser launch spike.
+const restoreConcurrency = parseInt(process.env.SESSION_RESTORE_CONCURRENCY) || 3
 const logLevel = process.env.LOG_LEVEL || 'info'
 const enableWebHook = process.env.ENABLE_WEBHOOK ? (process.env.ENABLE_WEBHOOK).toLowerCase() === 'true' : true
 const enableWebSocket = process.env.ENABLE_WEBSOCKET ? (process.env.ENABLE_WEBSOCKET).toLowerCase() === 'true' : false
@@ -66,6 +75,8 @@ module.exports = {
   browserCloseTimeoutMs,
   unpairedSessionMaxAgeMs,
   sessionWatchdogIntervalMs,
+  sessionStartSyncTimeoutMs,
+  restoreConcurrency,
   logLevel,
   enableWebHook,
   enableWebSocket,

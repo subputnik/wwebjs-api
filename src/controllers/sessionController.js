@@ -2,6 +2,7 @@ const qr = require('qr-image')
 const { setupSession, deleteSession, reloadSession, validateSession, flushSessions, destroySession, sessions } = require('../sessions')
 const { sendErrorResponse, waitForNestedObject, exposeFunctionIfAbsent } = require('../utils')
 const { logger } = require('../logger')
+const { sessionStartSyncTimeoutMs } = require('../config')
 
 /**
  * Starts a session for the given session ID.
@@ -19,7 +20,19 @@ const startSession = async (req, res) => {
   // #swagger.description = 'Starts a session for the given session ID.'
   const sessionId = req.params.sessionId
   try {
-    const setupSessionReturn = await setupSession(sessionId)
+    // Initializing a session can take longer than the caller's HTTP timeout
+    // (page load + auth timeout, currently 30s+). Never block the response that
+    // long: answer early and let the caller poll /session/status and /session/qr.
+    const setupPromise = setupSession(sessionId)
+    const timedOut = Symbol('timeout')
+    const setupSessionReturn = await Promise.race([
+      setupPromise,
+      new Promise(resolve => setTimeout(() => resolve(timedOut), sessionStartSyncTimeoutMs))
+    ])
+    if (setupSessionReturn === timedOut) {
+      setupPromise.catch(err => logger.error({ sessionId, err }, 'Background session start failed'))
+      return res.json({ success: true, message: 'Session initiation started, check session status' })
+    }
     if (!setupSessionReturn.success) {
       /* #swagger.responses[422] = {
         description: "Unprocessable Entity.",
@@ -30,7 +43,7 @@ const startSession = async (req, res) => {
         }
       }
       */
-      sendErrorResponse(res, 422, setupSessionReturn.message)
+      sendErrorResponse(res, 422, setupSessionReturn.message || 'Failed to start session')
       return
     }
     /* #swagger.responses[200] = {

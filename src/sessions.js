@@ -5,7 +5,7 @@ const { LoadUtils } = require('whatsapp-web.js/src/util/Injected/Utils')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, dumpio, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs, sessionWatchdogIntervalMs } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, dumpio, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs, sessionWatchdogIntervalMs, restoreConcurrency } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
@@ -318,16 +318,34 @@ const restoreSessions = () => {
     }
     // Read the contents of the folder
     fs.readdir(sessionFolderPath, async (_, files) => {
-      // Iterate through the files in the parent folder
+      const sessionIds = []
       for (const file of files) {
         // Use regular expression to extract the string from the folder name
         const match = file.match(/^session-(.+)$/)
         if (match) {
-          const sessionId = match[1]
-          logger.warn({ sessionId }, 'Existing session detected')
-          await setupSession(sessionId)
+          sessionIds.push(match[1])
         }
       }
+      logger.info({ count: sessionIds.length, concurrency: restoreConcurrency }, 'Restoring sessions')
+      // Restore with a bounded worker pool: a single session that takes minutes
+      // to initialize (or fails) must not hold back all the others.
+      const queue = [...sessionIds]
+      const worker = async () => {
+        while (queue.length > 0) {
+          const sessionId = queue.shift()
+          logger.warn({ sessionId }, 'Existing session detected')
+          try {
+            await setupSession(sessionId)
+          } catch (error) {
+            logger.error({ sessionId, err: error }, 'Failed to restore session')
+          }
+        }
+      }
+      const workers = Array.from(
+        { length: Math.max(1, Math.min(restoreConcurrency, queue.length)) },
+        () => worker()
+      )
+      await Promise.all(workers)
     })
   } catch (error) {
     logger.error(error, 'Failed to restore sessions')
@@ -351,6 +369,10 @@ const createSession = async (sessionId) => {
         executablePath: chromeBin,
         headless,
         dumpio,
+        // Puppeteer's own CDP call timeout; the default is too tight for this
+        // container and made session restarts fail with
+        // "Runtime.callFunctionOn timed out".
+        protocolTimeout: 180000,
         // Chromium treats a dropped D-Bus connection as fatal
         // ("FATAL:dbus/bus.cc] D-Bus connection was disconnected. Aborting.").
         // The session bus here belongs to transient login sessions, so instead of
@@ -448,7 +470,9 @@ const createSession = async (sessionId) => {
     sessions.set(sessionId, client)
     return { success: true, message: 'Session initiated successfully', client }
   } catch (error) {
-    return { success: false, message: error.message, client: null }
+    // initialize() can throw a bare string (e.g. 'auth timeout'), which would
+    // otherwise be reported as an empty error to the API caller.
+    return { success: false, message: (error && error.message) || String(error), client: null }
   }
 }
 

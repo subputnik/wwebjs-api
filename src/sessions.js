@@ -5,7 +5,7 @@ const { LoadUtils } = require('whatsapp-web.js/src/util/Injected/Utils')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, dumpio, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs, sessionWatchdogIntervalMs, restoreConcurrency } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, dumpio, releaseBrowserLock, recoverSessionMaxAttempts, recoverSessionBaseDelayMs, recoverSessionMaxDelayMs, browserCloseTimeoutMs, unpairedSessionMaxAgeMs, sessionWatchdogIntervalMs, restoreConcurrency, sessionStartCooldownMs } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
@@ -25,6 +25,10 @@ const unpairedSince = new Map()
 const recoveringSessions = new Set()
 // Sessions being stopped on purpose; their browser must not be auto-restarted.
 const stoppingSessions = new Set()
+// sessionId -> timestamp until which we refuse to start a session again after a
+// page load failure. WhatsApp rate limits the whole server IP (HTTP 429), and
+// retrying immediately only makes the block last longer.
+const sessionStartCooldowns = new Map()
 // Consecutive watchdog ticks where a live page was missing the injected
 // window.WWebJS helper (it disappears when WhatsApp Web navigates and the
 // library fails to re-inject). Used to avoid restarting on a short blip.
@@ -223,6 +227,10 @@ const recoverSession = async (sessionId, client, reason) => {
       await closeBrowser(client)
       const result = await setupSession(sessionId)
       if (result && result.success === true) {
+        return
+      }
+      if (result && /rate limiting this server/i.test(result.message || '')) {
+        logger.warn({ sessionId, message: result.message }, 'Session is in rate-limit cooldown, stopping recovery attempts')
         return
       }
       // A restart can itself fail (e.g. the new browser aborts during start).
@@ -453,6 +461,7 @@ const createSession = async (sessionId) => {
         sessionRecoverAttempts.delete(sessionId)
         injectionFailures.delete(sessionId)
         unpairedSince.delete(sessionId)
+        sessionStartCooldowns.delete(sessionId)
         patchWWebLibrary(client).catch((err) => {
           logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
         })
@@ -472,12 +481,27 @@ const createSession = async (sessionId) => {
   } catch (error) {
     // initialize() can throw a bare string (e.g. 'auth timeout'), which would
     // otherwise be reported as an empty error to the API caller.
-    return { success: false, message: (error && error.message) || String(error), client: null }
+    const message = (error && error.message) || String(error)
+    if (sessionStartCooldownMs > 0 && /auth timeout|ready timeout|ERR_HTTP_RESPONSE_CODE_FAILURE/i.test(message)) {
+      sessionStartCooldowns.set(sessionId, Date.now() + sessionStartCooldownMs)
+      logger.warn({ sessionId, cooldownMs: sessionStartCooldownMs, message }, 'Page failed to load, cooling down before the next attempt')
+    }
+    return { success: false, message, client: null }
   }
 }
 
 // Setup Session - concurrent calls for the same id share one in-flight setup
 const setupSession = async (sessionId) => {
+  const cooldownUntil = sessionStartCooldowns.get(sessionId)
+  if (cooldownUntil && Date.now() < cooldownUntil) {
+    const retryInSec = Math.ceil((cooldownUntil - Date.now()) / 1000)
+    return {
+      success: false,
+      message: `WhatsApp is rate limiting this server (HTTP 429). Retry in ${retryInSec}s.`,
+      client: null
+    }
+  }
+  sessionStartCooldowns.delete(sessionId)
   if (sessions.has(sessionId)) {
     return { success: false, message: `Session already exists for: ${sessionId}`, client: sessions.get(sessionId) }
   }

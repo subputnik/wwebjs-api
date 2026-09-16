@@ -43,6 +43,11 @@ const sessionStartSyncTimeoutMs = process.env.SESSION_START_SYNC_TIMEOUT_MS === 
 // How many sessions are started in parallel on boot. Keeps one slow or broken
 // session from delaying all the others while limiting the browser launch spike.
 const restoreConcurrency = parseInt(process.env.SESSION_RESTORE_CONCURRENCY) || 3
+// After a page load fails (WhatsApp answers 429 for this IP), refuse to start
+// that session again for this long. Retrying only deepens the block.
+const sessionStartCooldownMs = process.env.SESSION_START_COOLDOWN_MS === undefined
+  ? 600000
+  : (parseInt(process.env.SESSION_START_COOLDOWN_MS, 10) || 0)
 const logLevel = process.env.LOG_LEVEL || 'info'
 const enableWebHook = process.env.ENABLE_WEBHOOK ? (process.env.ENABLE_WEBHOOK).toLowerCase() === 'true' : true
 const enableWebSocket = process.env.ENABLE_WEBSOCKET ? (process.env.ENABLE_WEBSOCKET).toLowerCase() === 'true' : false
@@ -77,6 +82,7 @@ module.exports = {
   sessionWatchdogIntervalMs,
   sessionStartSyncTimeoutMs,
   restoreConcurrency,
+  sessionStartCooldownMs,
   logLevel,
   enableWebHook,
   enableWebSocket,

@@ -933,6 +933,12 @@ const getState = async (req, res) => {
   */
   try {
     const client = sessions.get(req.params.sessionId)
+    if (!client) {
+      // The session is not running (never started, stopped, or it failed to
+      // initialize). This route has no sessionValidation middleware, so guard
+      // here - otherwise it threw a TypeError and answered 500.
+      return res.json({ success: false, state: null, message: 'session_not_found' })
+    }
     const state = await client.getState()
     res.json({ success: true, state })
   } catch (error) {
